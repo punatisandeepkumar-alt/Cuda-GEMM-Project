@@ -1,0 +1,86 @@
+#include <stdio.h>
+#include <mma.h>
+#include <cuda_fp16.h>
+using namespace nvcuda;
+using namespace nvcuda::wmma;
+
+#define TILE_SIZE 16
+#define N 4096
+
+__global__ void SUNNY(half* a, half* b, float* c, int n){
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    fragment<matrix_a,16,16,16,half,row_major> a_frag;
+    fragment<matrix_b,16,16,16,half,col_major> b_frag;
+    fragment<accumulator,16,16,16,float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    for(int i=0; i<n/TILE_SIZE; i++){
+        load_matrix_sync(a_frag, a + row*n + i*TILE_SIZE, n);
+        load_matrix_sync(b_frag, b + i*TILE_SIZE*n + col, n);
+        mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+    store_matrix_sync(c + row*n + col, c_frag, n, mem_row_major);
+}
+
+int main(){
+    int n = N;
+
+    half *h_a, *h_b;
+    float *h_c;
+    cudaMallocHost(&h_a, sizeof(half)*n*n);
+    cudaMallocHost(&h_b, sizeof(half)*n*n);
+    cudaMallocHost(&h_c, sizeof(float)*n*n);
+
+    for(int i=0; i<n*n; i++){
+        h_a[i] = __float2half(1.0f);
+        h_b[i] = __float2half(2.0f);
+    }
+
+    half *d_a, *d_b;
+    float *d_c;
+    cudaMalloc(&d_a, sizeof(half)*n*n);
+    cudaMalloc(&d_b, sizeof(half)*n*n);
+    cudaMalloc(&d_c, sizeof(float)*n*n);
+
+    cudaMemcpy(d_a, h_a, sizeof(half)*n*n, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b, sizeof(half)*n*n, cudaMemcpyHostToDevice);
+
+    dim3 threads(TILE_SIZE, TILE_SIZE);
+    dim3 blocks(n/TILE_SIZE, n/TILE_SIZE);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    SUNNY<<<blocks,threads>>>(d_a, d_b, d_c, n);
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+
+    double ops = 2.0 * n * n * n;
+    double seconds = ms / 1000.0;
+    double gflops = (ops / seconds) / 1e9;
+
+    printf("TIME:   %.4f ms\n", ms);
+    printf("GFLOPS: %.2f\n", gflops);
+    printf("TFLOPS: %.4f\n", gflops / 1000.0);
+
+    cudaMemcpy(h_c, d_c, sizeof(float)*n*n, cudaMemcpyDeviceToHost);
+    printf("Result[0]: %.2f\n", h_c[0]);
+
+    cudaFree(d_a);
+    cudaFree(d_b);
+    cudaFree(d_c);
+    cudaFreeHost(h_a);
+    cudaFreeHost(h_b);
+    cudaFreeHost(h_c);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return 0;
+}
